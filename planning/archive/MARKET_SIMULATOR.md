@@ -8,6 +8,24 @@ The simulator uses **Geometric Brownian Motion (GBM)** to generate realistic sto
 
 Updates run at ~500ms intervals, producing a continuous stream of price changes that feel alive.
 
+### When the simulator is used
+
+The simulator is the default, and for most users it is the only source that streams live-looking prices:
+
+- `MASSIVE_API_KEY` empty or unset → simulator
+- A free **Basic** Massive key does **not** work for live prices. The Massive source polls the snapshot endpoint, which Basic doesn't include, so every poll fails. Free-plan users should leave `MASSIVE_API_KEY` empty
+- Paid Starter/Developer keys get prices that are 15 minutes delayed and update every poll interval (default 15s). Only Advanced is real-time
+
+## Output Contract (shared with the Massive source)
+
+`SimulatorDataSource` must write to `PriceCache` exactly as `MassiveDataSource` does (see `MARKET_INTERFACE.md`), so downstream code can't tell the sources apart:
+
+- `price`: float in dollars, rounded to 2 decimals
+- `timestamp`: **Unix seconds as a float**. The simulator passes no timestamp, so the cache uses `time.time()`. Massive converts the SDK's `last_trade.sip_timestamp` from **nanoseconds** (`/ 1e9`). Neither source writes milliseconds or nanoseconds into the cache
+- Ticker symbols are uppercase. `MassiveDataSource.add_ticker` uppercases its input, but the simulator stores tickers exactly as given, so callers (the service layer) must pass them already uppercased
+
+The simulator is stricter than this contract: it prices every tracked ticker on every tick and never leaves a gap. Massive can skip a ticker for a poll when `last_trade` is `None`, and it can fail a whole poll. Tests written against the simulator must not assume every ticker is always priced, or they will pass under the simulator and break under Massive.
+
 ## GBM Math
 
 At each time step, a stock price evolves as:
@@ -75,6 +93,8 @@ SEED_PRICES: dict[str, float] = {
 ```
 
 Tickers added dynamically (not in the seed list) start at a random price between $50-$300.
+
+These are static values. Real prices drift away from them over time, so expect a jump if a user switches from the simulator to a Massive key. Seeds could optionally be refreshed from Massive's Previous Close endpoint (`client.get_previous_close_agg(ticker)` → `.close`). Unlike snapshots, that endpoint is available on the free Basic plan, at 5 calls/min. It is not implemented; the simulator stays fully offline.
 
 ## Per-Ticker Parameters
 
@@ -243,3 +263,5 @@ backend/
 - The correlation matrix must be positive semi-definite — Cholesky decomposition guarantees this for valid correlation matrices
 - Random events happen ~0.1% of steps = roughly once every 500 seconds per ticker. With 10 tickers, expect an event somewhere roughly every 50 seconds — enough to keep it interesting
 - When a new ticker is added mid-session, the Cholesky matrix is rebuilt. This is O(n^2) but n is small (<50 tickers)
+- A newly added ticker is priced immediately. Under Massive it stays unpriced until the next poll, and indefinitely if the symbol is unknown
+- The simulator ignores market hours and ticks around the clock. Massive snapshots reset at 12am ET and repopulate from ~4am ET, and its timestamps are exchange trade times, which can be hours old

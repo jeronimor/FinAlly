@@ -120,22 +120,33 @@ def create_market_data_source(price_cache: PriceCache) -> MarketDataSource:
 
     if api_key:
         from .massive_client import MassiveDataSource
-        return MassiveDataSource(api_key=api_key, price_cache=price_cache)
+        poll_interval = float(os.environ.get("MASSIVE_POLL_INTERVAL", "15"))
+        return MassiveDataSource(
+            api_key=api_key, price_cache=price_cache, poll_interval=poll_interval
+        )
     else:
         from .simulator import SimulatorDataSource
         return SimulatorDataSource(price_cache=price_cache)
 ```
 
+**Plan requirement:** the Massive source polls the snapshot endpoint, which the free **Basic** plan does **not** include. A Basic key gets a non-200 response on every poll, so no prices arrive. Live Massive data needs **Starter** or higher; Starter and Developer data is 15 minutes delayed, and only Advanced gets real-time data (see `MASSIVE_API.md`). The factory can't detect the plan from the key, so a free key still selects Massive. Users on the free plan should leave `MASSIVE_API_KEY` empty and use the simulator.
+
+`MASSIVE_POLL_INTERVAL` defaults to 15s, which is 4 snapshot calls/min. Paid plans have unlimited calls and can poll every 2–5s.
+
 ## Massive Implementation Sketch
 
 ```python
 import asyncio
+import logging
 from massive import RESTClient
+from massive.exceptions import BadResponse
 from massive.rest.models import SnapshotMarketType
+
+logger = logging.getLogger(__name__)
 
 class MassiveDataSource(MarketDataSource):
     def __init__(self, api_key: str, price_cache: PriceCache, poll_interval: float = 15.0):
-        self._client = RESTClient(api_key=api_key)
+        self._client = RESTClient(api_key=api_key)  # raises AuthError if key is empty
         self._cache = price_cache
         self._interval = poll_interval
         self._tickers: list[str] = []
@@ -143,6 +154,7 @@ class MassiveDataSource(MarketDataSource):
 
     async def start(self, tickers: list[str]) -> None:
         self._tickers = list(tickers)
+        await self._poll_once()  # immediate first poll so the cache isn't empty
         self._task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
@@ -162,25 +174,39 @@ class MassiveDataSource(MarketDataSource):
 
     async def _poll_loop(self) -> None:
         while True:
-            await self._poll_once()
             await asyncio.sleep(self._interval)
+            await self._poll_once()
 
     async def _poll_once(self) -> None:
         if not self._tickers:
             return
-        # Run synchronous Massive client in thread pool
-        snapshots = await asyncio.to_thread(
-            self._client.get_snapshot_all,
-            market_type=SnapshotMarketType.STOCKS,
-            tickers=self._tickers,
-        )
+        try:
+            # The SDK is synchronous (urllib3) — run it in a thread
+            snapshots = await asyncio.to_thread(
+                self._client.get_snapshot_all,
+                market_type=SnapshotMarketType.STOCKS,
+                tickers=self._tickers,
+            )
+        except BadResponse as e:
+            # Any non-200 after the SDK's 3 built-in retries:
+            # 401 bad key, 403 plan lacks snapshots (free Basic plan), 429 rate limit
+            logger.error("Massive poll failed: %s", e)
+            return
+
         for snap in snapshots:
+            trade = snap.last_trade
+            # Every SDK field is Optional; last_trade can be None overnight
+            # (snapshots reset at 12am ET) or for thinly traded tickers
+            if trade is None or trade.price is None or trade.sip_timestamp is None:
+                continue
             self._cache.update(
                 ticker=snap.ticker,
-                price=snap.last_trade.price,
-                timestamp=snap.last_trade.timestamp / 1000,  # ms -> seconds
+                price=trade.price,
+                timestamp=trade.sip_timestamp / 1e9,  # nanoseconds -> seconds
             )
 ```
+
+**Field names matter.** `LastTrade` has no `timestamp` attribute. The trade time is `sip_timestamp`, in **nanoseconds**. Aggregate bars (`day`, `prev_day`, `min`) use milliseconds instead. Tests must not build snapshots from a bare `MagicMock()`, because it accepts any attribute name and would hide this kind of error. Use `MagicMock(spec=...)` with the real SDK models, or construct `TickerSnapshot.from_dict(...)` from raw JSON.
 
 ## Simulator Implementation Sketch
 
@@ -224,6 +250,23 @@ class SimulatorDataSource(MarketDataSource):
                 self._cache.update(ticker=ticker, price=price)
             await asyncio.sleep(self._interval)
 ```
+
+## Source Differences Downstream Code Must Tolerate
+
+Both sources write the same `PriceUpdate`, but they behave differently:
+
+| | Simulator | Massive |
+|---|---|---|
+| Update cadence | ~500ms | Once per `MASSIVE_POLL_INTERVAL` (default 15s) |
+| New ticker priced | Immediately (seed price) | On the next poll; unknown symbols stay unpriced |
+| `timestamp` meaning | Wall-clock time of the tick (`time.time()`) | Exchange time of the last trade (`sip_timestamp / 1e9`). Can lag wall-clock time by 15 min on Starter/Developer, or by hours when the market is closed |
+| Missing data | Never | A ticker can be absent from the response or have `last_trade=None`. Its previous cached price is kept |
+| Failure mode | None | `BadResponse` is logged and the cache keeps its last values |
+| Plan needed | — | Starter+ (snapshots aren't on the free Basic plan) |
+
+So:
+- Never assume every tracked ticker has a cached price. Use the "No price available" path in trade execution and show `null` / "—" in the UI
+- Don't compute staleness by comparing `timestamp` with `time.time()`, because Massive timestamps are legitimately old outside market hours
 
 ## Integration with SSE
 
