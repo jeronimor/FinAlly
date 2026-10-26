@@ -14,6 +14,14 @@ class PriceUpdate:
     price: float
     previous_price: float
     timestamp: float = field(default_factory=time.time)  # Unix seconds
+    session_open: float | None = None  # First price seen since server start
+
+    @property
+    def session_change_percent(self) -> float:
+        """Percentage change since the session open (0.0 if unknown)."""
+        if not self.session_open:
+            return 0.0
+        return round((self.price - self.session_open) / self.session_open * 100, 4)
 
     @property
     def change(self) -> float:
@@ -42,8 +50,10 @@ class PriceUpdate:
             "ticker": self.ticker,
             "price": self.price,
             "previous_price": self.previous_price,
+            "session_open": self.session_open if self.session_open is not None else self.price,
             "timestamp": self.timestamp,
             "change": self.change,
             "change_percent": self.change_percent,
+            "session_change_percent": self.session_change_percent,
             "direction": self.direction,
         }

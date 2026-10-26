@@ -101,3 +101,19 @@ class TestPriceCache:
         cache = PriceCache()
         update = cache.update("AAPL", 190.12345)
         assert update.price == 190.12
+
+    def test_session_open_is_first_price(self):
+        """Session open is the first price seen and does not change."""
+        cache = PriceCache()
+        first = cache.update("AAPL", 100.00)
+        second = cache.update("AAPL", 110.00)
+        assert first.session_open == 100.00
+        assert second.session_open == 100.00
+        assert second.session_change_percent == 10.0
+
+    def test_remove_resets_session_open(self):
+        """Removing a ticker resets its session open."""
+        cache = PriceCache()
+        cache.update("AAPL", 100.00)
+        cache.remove("AAPL")
+        assert cache.update("AAPL", 120.00).session_open == 120.00
