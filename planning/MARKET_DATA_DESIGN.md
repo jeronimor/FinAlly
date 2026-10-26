@@ -2,15 +2,15 @@
 
 Implementation design for the FinAlly market data subsystem (`backend/app/market/`): the unified source interface, the shared price cache, the GBM simulator, the Massive (Polygon.io) poller, the SSE stream, and how the rest of the backend wires into it.
 
-This document describes the **target state**. Most of it already exists (see `MARKET_DATA_SUMMARY.md`); every place where the target differs from the current code is marked **Δ CHANGE** and gathered into a checklist in §12. It supersedes `archive/MARKET_DATA_DESIGN.md`, which predates PLAN.md §6/§13 and the Massive SDK verification in `archive/MASSIVE_API.md`.
+This document describes the **target state**. Most of it already exists (see `MARKET_DATA_SUMMARY.md`); every place where the target differs from the current code is marked **Δ CHANGE** and gathered into a checklist in §12.
 
-Source documents: `PLAN.md` §3, §5, §6, §7, §12, §13 · `REVIEW.md` · `archive/MASSIVE_API.md` · `archive/MARKET_SIMULATOR.md` · `archive/MARKET_INTERFACE.md`.
+Source documents (all in `planning/`): `PLAN.md` §3, §5, §6, §7, §12, §13 · `MARKET_DATA_SUMMARY.md` · `REVIEW.md` · `MARKET_INTERFACE.md` · `MARKET_SIMULATOR.md` · `MASSIVE_API.md`. Where they disagree, §1.1 says which one this design follows.
 
 ---
 
 ## Contents
 
-1. [Requirements](#1-requirements)
+1. [Requirements](#1-requirements) · [1.1 Reconciling the planning docs](#11-reconciling-the-planning-docs)
 2. [Architecture](#2-architecture)
 3. [Data model — `models.py`](#3-data-model--modelspy)
 4. [Price cache — `cache.py`](#4-price-cache--cachepy)
@@ -42,6 +42,30 @@ Distilled from PLAN.md:
 | R9 | Event fields: `ticker, price, previous_price, session_open, timestamp (unix float), change, change_percent, session_change_percent, direction` | §6 |
 | R10 | A ticker removal must reach connected SSE clients | REVIEW.md P1 |
 | R11 | Router factory must be callable more than once | §13.2 |
+| R12 | Cache `timestamp` is always Unix **seconds** (float); Massive's is the exchange trade time, never wall clock | `MARKET_SIMULATOR.md` output contract, `MARKET_INTERFACE.md` |
+| R13 | Tickers in the cache are uppercase, whichever source wrote them | `MARKET_SIMULATOR.md` output contract |
+| R14 | A missing or failed Massive poll keeps the last cached values; downstream code never assumes every tracked ticker is priced | `MARKET_INTERFACE.md` |
+| R15 | Massive needs a Starter+ plan (snapshot endpoint); a free Basic key selects Massive but never prices anything | `MASSIVE_API.md` |
+
+### 1.1 Reconciling the planning docs
+
+`MARKET_INTERFACE.md` and `MARKET_SIMULATOR.md` were written as design sketches before the code; `MASSIVE_API.md` was verified against the SDK on 2026-10-23. Where they differ from each other or from the code, this design takes the following position:
+
+| Topic | What the docs say | This design |
+|---|---|---|
+| `PriceUpdate` shape | `MARKET_INTERFACE.md`: mutable dataclass with stored `change`/`direction` fields | Keep the code's frozen dataclass with computed properties; add `session_open` (§3) |
+| Where `PriceCache` lives | `MARKET_INTERFACE.md` file tree: `interface.py` | Keep the code's `cache.py` |
+| SSE cadence | `MARKET_INTERFACE.md` sketch: push every 500 ms unconditionally | PLAN §6 wins: check every 500 ms, push only on version change (§9) |
+| Massive timestamp | `MASSIVE_API.md` / `MARKET_INTERFACE.md`: `last_trade.sip_timestamp / 1e9`; code: `last_trade.timestamp / 1000` | Docs are right, code is broken (§7.1) |
+| Massive missing timestamp | `MARKET_INTERFACE.md`: skip the snapshot | Fall back to `snap.updated` (also exchange-side ns), skip only if both are missing; never substitute wall clock (R12) |
+| Massive errors | `MARKET_INTERFACE.md`: catch `BadResponse` | Catch `Exception`: network failures surface as urllib3 errors (e.g. `MaxRetryError`), not `BadResponse`, and must not kill the loop (§7.4) |
+| `RESTClient` construction | `MARKET_INTERFACE.md`: in `__init__` | Keep the code's: in `start()`, so constructing an unstarted source does no I/O and never raises `AuthError` |
+| Ticker case in the simulator | `MARKET_SIMULATOR.md`: stores tickers as given; callers must uppercase | Simulator normalizes too, matching Massive (§6.4); the service layer still normalizes first |
+| `GBMSimulator.add_ticker` in `__init__` | `MARKET_SIMULATOR.md`: rebuilds Cholesky per ticker | Keep the code's single rebuild after batch init |
+| Seed refresh from Massive Previous Close | `MARKET_SIMULATOR.md`: optional, not implemented | Out of scope; the simulator stays fully offline |
+| Free Basic Massive key | `MARKET_INTERFACE.md`, `MASSIVE_API.md`: factory can't detect the plan | Same: no plan detection. The factory's log line and `.env.example` comment tell free-plan users to leave the key empty (§8) |
+
+`CLAUDE.md` at the repo root still points to a `planning/archive` folder, which no longer exists; it should point to `planning/` (checklist item 7).
 
 ---
 
@@ -345,8 +369,17 @@ Differences downstream code must tolerate (and nothing else):
 | Update cadence | every 0.5 s | every `MASSIVE_POLL_INTERVAL` s |
 | Newly added ticker | priced immediately | `None` until next poll |
 | Unknown / invalid symbol | priced (random seed) | stays `None` forever |
-| `timestamp` | wall clock | exchange SIP trade time |
-| Outside market hours | keeps moving | price frozen (no version bump → no SSE events) |
+| `timestamp` | wall clock (`time.time()`) | exchange SIP trade time; 15 min old on Starter/Developer, hours old when the market is closed |
+| Missing data | never | ticker absent from the response or `last_trade=None` → previous cached value kept |
+| Failure mode | none | poll error logged; whole cache keeps its last values |
+| Outside market hours | keeps moving | same last trade re-sent each poll (flat); snapshots reset at 12am ET and repopulate from ~4am ET |
+| Plan needed | — | Starter or above |
+
+Consequences for downstream code:
+
+- Never assume a tracked ticker has a cached price: trades take the "No price available" path, the UI shows "—".
+- Never judge staleness by comparing `timestamp` with `time.time()`; Massive timestamps are legitimately old.
+- Tests written only against the simulator must not rely on "every ticker priced every tick" — that holds for the simulator alone.
 
 ---
 
@@ -367,6 +400,10 @@ CORRELATION_GROUPS = {"tech": {"AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", 
                       "finance": {"JPM", "V"}}
 INTRA_TECH_CORR, INTRA_FINANCE_CORR, CROSS_GROUP_CORR, TSLA_CORR = 0.6, 0.5, 0.3, 0.3
 ```
+
+Seeds are static, so real prices drift away from them; switching from the simulator to a Massive key shows a jump. Refreshing seeds from Massive's Previous Close endpoint (available on the free plan) is possible but out of scope — see `MARKET_SIMULATOR.md`.
+
+Housekeeping: the comment in `GBMSimulator._pairwise_correlation` says "TSLA is in tech set", but `CORRELATION_GROUPS["tech"]` doesn't include TSLA. Behavior is correct (TSLA gets 0.3 with everything); fix the comment.
 
 ### 6.2 Math
 
@@ -431,7 +468,9 @@ The simulator keeps full-precision internal prices and only rounds what it emits
 
 ### 6.4 `SimulatorDataSource`
 
-**Δ CHANGE:** normalize tickers (`strip().upper()`) in `start/add_ticker/remove_ticker`, matching `MassiveDataSource`. The service layer already normalizes, so this is defense in depth; it guarantees the cache never holds two spellings of one ticker.
+**Δ CHANGE:** normalize tickers (`strip().upper()`) in `start/add_ticker/remove_ticker`, matching `MassiveDataSource`. `MARKET_SIMULATOR.md` notes that today the simulator stores tickers exactly as given and relies on callers to uppercase; this closes that gap (R13). The service layer still normalizes first, so this is defense in depth that guarantees the cache never holds two spellings of one ticker.
+
+The simulator passes no timestamp, so the cache stamps each update with `time.time()` (Unix seconds, R12).
 
 ```python
 def _normalize(ticker: str) -> str:
@@ -505,7 +544,7 @@ Concurrency: `add_ticker`/`remove_ticker` and `_run_loop` run on the same event 
 
 ## 7. Massive API — `massive_client.py`
 
-Uses the `massive` SDK (lockfile pins 2.2.0) and the multi-ticker snapshot endpoint, `GET /v2/snapshot/locale/us/markets/stocks/tickers?tickers=...`: one HTTP call per poll for all tracked tickers. Details and plan limits are in `archive/MASSIVE_API.md`.
+Uses the `massive` SDK (lockfile pins 2.2.0) and the multi-ticker snapshot endpoint, `GET /v2/snapshot/locale/us/markets/stocks/tickers?tickers=...`: one HTTP call per poll for all tracked tickers. Endpoint details, plan limits and SDK field names are in `MASSIVE_API.md`.
 
 ### 7.1 Current defects
 
@@ -516,7 +555,8 @@ Other changes:
 - **Δ** Snapshot the ticker list on the event loop and pass it to the worker thread; today `_fetch_snapshots` reads `self._tickers` from the thread while `add_ticker` may be appending to it.
 - **Δ** Bound the initial poll in `start()` with a timeout so a slow or unreachable API can't stall app startup (the SDK retries up to 3× internally).
 - **Δ** Treat `last_trade is None` / `price is None` explicitly (thin or overnight tickers) instead of relying on an exception.
-- **Δ** Fall back to `snap.updated` (also ns) and then wall clock when `sip_timestamp` is missing.
+- **Δ** Fall back to `snap.updated` (also ns, exchange-side) when `sip_timestamp` is missing; skip the snapshot if both are missing. Never substitute wall clock (R12).
+- **Δ** Log `BadResponse` (key / plan / rate limit) separately from network errors, so a free-plan key is easy to diagnose.
 - **Δ** Reject a non-positive poll interval.
 
 ### 7.2 Target implementation
@@ -528,9 +568,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from massive import RESTClient
+from massive.exceptions import BadResponse
 from massive.rest.models import SnapshotMarketType, TickerSnapshot
 
 from .cache import PriceCache
@@ -545,14 +585,16 @@ def parse_snapshot(snap: TickerSnapshot) -> tuple[str, float, float] | None:
     """Extract (ticker, price, unix_seconds) from a snapshot, or None if unusable.
 
     Every SDK field is Optional: last_trade is None for thinly traded tickers and
-    overnight (snapshots are cleared at 12am ET). Trade timestamps are nanoseconds.
+    overnight (snapshots are cleared at 12am ET). Trade timestamps are nanoseconds
+    (aggregate bars use milliseconds — not used here).
     """
     trade = snap.last_trade
     if not snap.ticker or trade is None or trade.price is None or trade.price <= 0:
         return None
     ts_ns = trade.sip_timestamp or snap.updated
-    timestamp = ts_ns / NS_PER_SECOND if ts_ns else time.time()
-    return snap.ticker, float(trade.price), timestamp
+    if not ts_ns:
+        return None
+    return snap.ticker, float(trade.price), ts_ns / NS_PER_SECOND
 
 
 class MassiveDataSource(MarketDataSource):
@@ -632,7 +674,10 @@ class MassiveDataSource(MarketDataSource):
             return
         try:
             snapshots = await asyncio.to_thread(self._fetch_snapshots, tickers)
-        except Exception as e:  # BadResponse (401/403/429 after retries), network errors
+        except BadResponse as e:  # non-200 after the SDK's 3 retries: 401 / 403 / 429
+            logger.error("Massive poll rejected (check key; snapshots need Starter+): %s", e)
+            return
+        except Exception as e:  # network: urllib3 MaxRetryError, timeouts, DNS
             logger.error("Massive poll failed: %s", e)
             return
 
@@ -685,19 +730,30 @@ cache.get("AAPL").to_dict()    # {"price": 191.74, "timestamp": 1760600000.123, 
 
 | Situation | What happens |
 |---|---|
-| Invalid key (401) / plan lacks snapshots (403) | `BadResponse` after SDK retries → `logger.error` each poll; app keeps running, prices stay `null` |
-| Rate limited (429) | SDK retries 3× with backoff, then same as above; next poll retries |
-| Network down / timeout | Logged; next poll retries |
+| Invalid key (401) | `BadResponse` → "poll rejected" logged every poll; app keeps running; cache keeps its last values (none, if it never succeeded) |
+| Free Basic key (403: plan lacks snapshots) | Same as 401 — the most likely misconfiguration. Fix: leave `MASSIVE_API_KEY` empty and use the simulator, or upgrade to Starter+ |
+| Rate limited (429) | SDK retries 3× with backoff (urllib3 `Retry(total=3, backoff_factor=0.1)`), then as above; next poll retries |
+| Network down / timeout | urllib3 error → "poll failed" logged; next poll retries |
 | Unknown symbol (`ZZZZ`) | Absent from the response → never priced; watchlist shows "—" (intended, PLAN §8) |
-| Ticker with no trade today | `parse_snapshot` → `None`, skipped |
+| Ticker with no trade / overnight | `parse_snapshot` → `None`, skipped; previous cached value kept |
+| `RESTClient()` with empty key | `AuthError` — cannot happen, the factory only builds Massive for a non-empty key |
 
-The SDK client's own timeouts apply inside the thread; a hung request occupies one default-executor thread until urllib3 times out, and the next poll still runs on schedule.
+Polls are sequential: a slow request delays the next poll rather than overlapping it, which also guarantees at most one in-flight request (good for rate limits). The SDK's urllib3 timeouts bound how long one poll can take.
 
 ---
 
 ## 8. Factory — `factory.py`
 
-**Δ CHANGE (§13.3):** read `MASSIVE_POLL_INTERVAL` (default 15) and pass it through. An invalid value logs a warning and falls back to the default rather than crashing startup.
+**Δ CHANGE (§13.3):** read `MASSIVE_POLL_INTERVAL` (default 15) and pass it through. An invalid value logs a warning and falls back to the default rather than crashing startup. (`MARKET_INTERFACE.md`'s sketch calls `float(...)` directly, which would crash on a typo.)
+
+The factory cannot tell a free Basic key from a paid one, so a Basic key still selects Massive and then never prices anything (R15). Rather than probing the API at startup, the selection log line says so, and `.env.example` repeats it next to `MASSIVE_API_KEY`:
+
+```bash
+# Optional: Massive (Polygon.io) API key for real market data.
+# Needs a Starter plan or above — the free Basic plan has no snapshot access.
+# Leave empty to use the built-in simulator (recommended).
+MASSIVE_API_KEY=
+```
 
 ```python
 """Factory for creating market data sources."""
@@ -744,7 +800,8 @@ def create_market_data_source(price_cache: PriceCache) -> MarketDataSource:
     api_key = os.environ.get("MASSIVE_API_KEY", "").strip()
     if api_key:
         interval = _poll_interval_from_env()
-        logger.info("Market data source: Massive API (poll every %.1fs)", interval)
+        logger.info("Market data source: Massive API (poll every %.1fs; requires a "
+                    "Starter+ plan — free keys cannot read snapshots)", interval)
         return MassiveDataSource(api_key=api_key, price_cache=price_cache,
                                  poll_interval=interval)
     logger.info("Market data source: GBM simulator")
@@ -768,6 +825,7 @@ The factory reads `os.environ` only; `load_dotenv()` is called once by the app e
 1. Create the `APIRouter` **inside** the factory (§13.2). Today the module-level `router` gets a second `/prices` route each time `create_stream_router()` is called (e.g. once per test app).
 2. Emit on every version change **including when the cache becomes empty** (`data: {}`), so removing the last ticker clears the client. Today an empty cache emits nothing.
 3. Expose the poll interval as a factory argument so tests can run fast.
+4. Stop swallowing `CancelledError` (see notes below).
 
 ```python
 """SSE streaming endpoint for live price updates."""
@@ -825,14 +883,13 @@ async def _generate_events(
                 data = {t: u.to_dict() for t, u in price_cache.get_all().items()}
                 yield f"data: {json.dumps(data)}\n\n"
             await asyncio.sleep(interval)
-    except asyncio.CancelledError:
-        pass
-    finally:
+    finally:  # let CancelledError propagate — swallowing it breaks server shutdown
         logger.info("SSE client disconnected: %s", client)
 ```
 
 Notes:
 
+- **Δ** The current generator catches and swallows `asyncio.CancelledError`. Don't: cancellation must propagate so uvicorn shutdown and `wait_for` timeouts work. The `finally` block is enough for logging.
 - The initial `last_version = -1` guarantees a full snapshot as the first data event, so a (re)connecting client is immediately consistent. On a fresh server with an empty cache the first event is `data: {}`, which is valid and harmless.
 - Reading `version` and then `get_all()` is not atomic, but the race is benign: a concurrent update lands in this snapshot early and then triggers one extra (identical-or-newer) event next cycle. Nothing is ever lost.
 - The frontend treats each event as the **complete** set of tracked tickers (tickers missing from an event are no longer tracked); it appends each ticker's `price` to its ring buffer only when `timestamp` changed, so repeated Massive snapshots don't add duplicate sparkline points.
@@ -1019,6 +1076,20 @@ def test_parse_snapshot_missing_trade():
     assert parse_snapshot(_snap("AAPL", None)) is None
 
 
+def test_parse_snapshot_without_any_timestamp_is_skipped():
+    assert parse_snapshot(_snap("AAPL", 191.74, sip_ns=None)) is None
+
+
+def test_parse_snapshot_from_raw_json():
+    # Raw API keys (abbreviated), exactly as MASSIVE_API.md documents them
+    snap = TickerSnapshot.from_dict({
+        "ticker": "AAPL",
+        "lastTrade": {"p": 191.74, "s": 100, "x": 4, "t": 1760600000123000000},
+        "updated": 1760600000500000000,
+    })
+    assert parse_snapshot(snap) == ("AAPL", 191.74, 1760600000.123)
+
+
 async def test_removed_mid_poll_not_reinserted():
     cache = PriceCache()
     src = MassiveDataSource("k", cache, poll_interval=60)
@@ -1033,16 +1104,29 @@ async def test_removed_mid_poll_not_reinserted():
     assert "AAPL" not in cache
 
 
-async def test_poll_error_is_swallowed():
+@pytest.mark.parametrize("error", [BadResponse('{"status":"NOT_AUTHORIZED"}'),
+                                   ConnectionError("network down")])
+async def test_failed_poll_keeps_last_values(error):
     cache = PriceCache()
+    cache.update("AAPL", 190.0, timestamp=1.0)
     src = MassiveDataSource("k", cache, poll_interval=60)
     src._client, src._tickers = MagicMock(), ["AAPL"]
-    with patch.object(src, "_fetch_snapshots", side_effect=RuntimeError("403")):
+    with patch.object(src, "_fetch_snapshots", side_effect=error):
         await src._poll_once()     # must not raise
-    assert len(cache) == 0
+    assert cache.get_price("AAPL") == 190.0   # R14
+
+
+async def test_ticker_missing_from_response_keeps_last_value():
+    cache = PriceCache()
+    cache.update("MSFT", 420.0, timestamp=1.0)
+    src = MassiveDataSource("k", cache, poll_interval=60)
+    src._client, src._tickers = MagicMock(), ["AAPL", "MSFT"]
+    with patch.object(src, "_fetch_snapshots", return_value=[_snap("AAPL", 190.0)]):
+        await src._poll_once()
+    assert cache.get_price("MSFT") == 420.0
 ```
 
-Rewrite the existing `_make_snapshot` helper (`MagicMock` with `last_trade.timestamp` in ms) on top of `_snap`; it is the reason the §7.1 bug went unnoticed. `_fetch_snapshots` now takes the ticker list, so patched `return_value` mocks keep working but `side_effect` functions take one argument.
+Rewrite the existing `_make_snapshot` helper (`MagicMock` with `last_trade.timestamp` in ms) on top of `_snap`; it is the reason the §7.1 bug went unnoticed. As `MARKET_INTERFACE.md` puts it: never build snapshots from a bare `MagicMock()`. Use the real models, `TickerSnapshot.from_dict(...)` on raw JSON, or at minimum `MagicMock(spec=TickerSnapshot)`. `_fetch_snapshots` now takes the ticker list, so patched `return_value` mocks keep working but `side_effect` functions take one argument.
 
 ### 11.3 Factory (`test_factory.py`)
 
@@ -1106,13 +1190,16 @@ def test_router_factory_is_reentrant():
 
 ### 11.5 Simulator
 
-Existing coverage is good. Add: `start([" aapl", "AAPL"])` tracks one ticker `AAPL`; a statistical check that the empirical correlation of log returns between AAPL and MSFT over ~2,000 steps (shocks disabled) is in `[0.5, 0.7]`.
+Existing coverage is good. Add: `start([" aapl", "AAPL"])` tracks one ticker `AAPL`; a statistical check that the empirical correlation of log returns between AAPL and MSFT over ~2,000 steps (shocks disabled) is in `[0.5, 0.7]`; every price stays positive over a long run (GBM is multiplicative); an event rate near `event_probability` over many steps.
+
+Keep simulator-specific guarantees (every tracked ticker priced on every tick) inside these simulator tests. Tests for anything downstream of the cache must also hold for Massive, where tickers can be missing (`MARKET_SIMULATOR.md`, R14).
 
 ### 11.6 Service-layer (lives with the portfolio/watchlist tests, PLAN §12)
 
 - Remove a held ticker from the watchlist → still in `source.get_tickers()` and the cache.
 - Sell an unwatched position to zero → removed from source and cache.
 - Buy a ticker with no cached price → `"No price available for X — add it to the watchlist first"`.
+- Run the watchlist/portfolio tests against a stub `MarketDataSource` that tracks tickers but never prices newly added ones (Massive-like), so `null` prices and the `avg_cost` fallback are covered.
 
 ---
 
@@ -1124,12 +1211,12 @@ Ordered for implementation; each item lists its tests.
 |---|---|---|---|
 | 1 | `models.py` | add `session_open`, `session_change_percent`; extend `to_dict()` | 11.1, update `test_models.py` |
 | 2 | `cache.py` | track session open; `remove()` bumps version + clears open; `is not None` timestamp; locked `version` | 11.1 |
-| 3 | `massive_client.py` | **fix `sip_timestamp` (ns)**; `parse_snapshot()`; ticker snapshot passed to thread; tracked re-check; start timeout; interval validation | 11.2 (real SDK models) |
-| 4 | `factory.py` | `MASSIVE_POLL_INTERVAL` with fallback | 11.3 |
-| 5 | `stream.py` | router created per call; emit empty snapshot; `interval` param | 11.4 |
-| 6 | `simulator.py` | normalize + dedupe tickers | 11.5 |
-| 7 | `interface.py`, `backend/CLAUDE.md` | doc updates (normalization, removal semantics, new fields, `remove()` bumps version) | — |
-| 8 | repo root | `db/.gitkeep`; `db/*.db` in `.gitignore`; commit `.env.example` (PLAN §5) | — |
+| 3 | `massive_client.py` | **fix `sip_timestamp` (ns)**; `parse_snapshot()` (no wall-clock fallback); `BadResponse` vs network logging; ticker snapshot passed to thread; tracked re-check; start timeout; interval validation | 11.2 (real SDK models / `from_dict`) |
+| 4 | `factory.py` | `MASSIVE_POLL_INTERVAL` with fallback; Starter+ hint in log | 11.3 |
+| 5 | `stream.py` | router created per call; emit empty snapshot; `interval` param; let `CancelledError` propagate | 11.4 |
+| 6 | `simulator.py` | normalize + dedupe tickers; fix TSLA comment | 11.5 |
+| 7 | docs | `interface.py` and `backend/CLAUDE.md` (normalization, removal semantics, new fields, `remove()` bumps version); root `CLAUDE.md` points to `planning/` instead of the removed `planning/archive`; `MARKET_DATA_SUMMARY.md` mentions this design | — |
+| 8 | repo root | `db/.gitkeep`; `db/*.db` in `.gitignore`; commit `.env.example` with the Starter+ note (PLAN §5, §8 here) | — |
 | 9 | `pyproject.toml` | `uv add python-dotenv` (used by `main.py`, §10.1) | — |
 
 Then run:
@@ -1140,7 +1227,7 @@ uv run --extra dev pytest -q
 uv run --extra dev ruff check app/ tests/
 ```
 
-And a manual Massive smoke test with a Starter+ key (the free Basic plan cannot use the snapshot endpoint — see `archive/MASSIVE_API.md`):
+And a manual Massive smoke test with a Starter+ key (the free Basic plan cannot use the snapshot endpoint — see `MASSIVE_API.md`). Outside US market hours expect old timestamps or, between 12am and ~4am ET, no prices at all:
 
 ```bash
 MASSIVE_API_KEY=... MASSIVE_POLL_INTERVAL=5 uv run python -c "
