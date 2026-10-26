@@ -77,3 +77,15 @@ class TestFactory:
 
         assert isinstance(source, MassiveDataSource)
         assert source._cache is cache
+
+    def test_poll_interval_default_custom_and_invalid(self):
+        """MASSIVE_POLL_INTERVAL is honored; invalid values fall back to 15."""
+        def interval(extra):
+            env = dict(extra, MASSIVE_API_KEY="k")
+            with patch.dict(os.environ, env, clear=True):
+                return create_market_data_source(PriceCache())._interval
+
+        assert interval({}) == 15.0
+        assert interval({"MASSIVE_POLL_INTERVAL": "5"}) == 5.0
+        assert interval({"MASSIVE_POLL_INTERVAL": "abc"}) == 15.0
+        assert interval({"MASSIVE_POLL_INTERVAL": "-1"}) == 15.0
