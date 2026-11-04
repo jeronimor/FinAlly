@@ -136,3 +136,20 @@ class TestSimulatorDataSource:
         # Just verify it starts and stops cleanly
         await asyncio.sleep(0.2)
         await source.stop()
+
+    async def test_tickers_normalized_and_deduped(self):
+        """Tickers are stripped/uppercased and duplicates dropped."""
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=10.0)
+        await source.start([" aapl", "AAPL", "msft "])
+        assert source.get_tickers() == ["AAPL", "MSFT"]
+        assert set(cache.get_all()) == {"AAPL", "MSFT"}
+
+        await source.add_ticker(" tsla")
+        await source.add_ticker("TSLA")
+        assert source.get_tickers() == ["AAPL", "MSFT", "TSLA"]
+
+        await source.remove_ticker("msft")
+        assert "MSFT" not in source.get_tickers()
+        assert "MSFT" not in cache
+        await source.stop()

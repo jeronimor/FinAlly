@@ -17,17 +17,17 @@ from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_
 
 ### Core Types
 
-- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp`, plus properties `change`, `change_percent`, `direction` ("up"/"down"/"flat"), and `to_dict()` for JSON serialization.
+- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp` (Unix seconds), `session_open` (first price seen since server start), plus properties `change`, `change_percent` (tick-to-tick), `session_change_percent` (since session open), `direction` ("up"/"down"/"flat"), and `to_dict()` for JSON serialization (the SSE shape in PLAN §6).
 
 - **`PriceCache`** — Thread-safe in-memory store. Key methods:
   - `update(ticker, price, timestamp=None) -> PriceUpdate`
   - `get(ticker) -> PriceUpdate | None`
   - `get_price(ticker) -> float | None`
   - `get_all() -> dict[str, PriceUpdate]`
-  - `remove(ticker)`
-  - `version` property — monotonic counter, increments on every update (for SSE change detection)
+  - `remove(ticker)` — drops the price and session open; bumps `version` if the ticker was present. Re-adding starts a new session open
+  - `version` property — monotonic counter, increments on every update and removal (for SSE change detection)
 
-- **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
+- **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`. Tickers are stripped, uppercased and deduplicated. `remove_ticker()` also removes the ticker from the cache. The simulator prices an added ticker immediately; Massive prices it on the next poll.
 
 - **`create_market_data_source(cache)`** — Factory. Returns `MassiveDataSource` if `MASSIVE_API_KEY` is set, otherwise `SimulatorDataSource`.
 
@@ -38,6 +38,8 @@ from app.market import create_stream_router
 
 router = create_stream_router(price_cache)  # Returns FastAPI APIRouter
 # Endpoint: GET /api/stream/prices (text/event-stream)
+# Sends `retry: 1000`, then all prices whenever the cache version changes
+# (checked every 500ms). An empty cache is sent as `{}`.
 ```
 
 ### Seed Data

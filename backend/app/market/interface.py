@@ -27,6 +27,7 @@ class MarketDataSource(ABC):
         """Begin producing price updates for the given tickers.
 
         Starts a background task that periodically writes to the PriceCache.
+        Tickers are normalized (stripped, uppercased) and deduplicated.
         Must be called exactly once. Calling start() twice is undefined behavior.
         """
 
@@ -42,14 +43,16 @@ class MarketDataSource(ABC):
     async def add_ticker(self, ticker: str) -> None:
         """Add a ticker to the active set. No-op if already present.
 
-        The next update cycle will include this ticker.
+        The ticker is normalized (stripped, uppercased). The simulator prices it
+        immediately; Massive prices it on the next poll.
         """
 
     @abstractmethod
     async def remove_ticker(self, ticker: str) -> None:
         """Remove a ticker from the active set. No-op if not present.
 
-        Also removes the ticker from the PriceCache.
+        Also removes the ticker from the PriceCache, which bumps the cache
+        version so SSE clients see the removal on the next tick.
         """
 
     @abstractmethod

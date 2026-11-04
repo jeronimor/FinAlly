@@ -117,3 +117,16 @@ class TestPriceCache:
         cache.update("AAPL", 100.00)
         cache.remove("AAPL")
         assert cache.update("AAPL", 120.00).session_open == 120.00
+
+    def test_remove_bumps_version_only_when_present(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        v = cache.version
+        cache.remove("AAPL")
+        assert cache.version == v + 1
+        cache.remove("AAPL")
+        assert cache.version == v + 1
+
+    def test_zero_timestamp_is_kept(self):
+        cache = PriceCache()
+        assert cache.update("AAPL", 1.00, timestamp=0.0).timestamp == 0.0

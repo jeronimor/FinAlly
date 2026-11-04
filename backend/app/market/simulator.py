@@ -25,6 +25,11 @@ from .seed_prices import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize(ticker: str) -> str:
+    """Canonical ticker form: stripped and uppercase."""
+    return ticker.strip().upper()
+
+
 class GBMSimulator:
     """Geometric Brownian Motion simulator for correlated stock prices.
 
@@ -217,6 +222,7 @@ class SimulatorDataSource(MarketDataSource):
         self._task: asyncio.Task | None = None
 
     async def start(self, tickers: list[str]) -> None:
+        tickers = list(dict.fromkeys(_normalize(t) for t in tickers))
         self._sim = GBMSimulator(
             tickers=tickers,
             event_probability=self._event_prob,
@@ -240,6 +246,7 @@ class SimulatorDataSource(MarketDataSource):
         logger.info("Simulator stopped")
 
     async def add_ticker(self, ticker: str) -> None:
+        ticker = _normalize(ticker)
         if self._sim:
             self._sim.add_ticker(ticker)
             # Seed cache immediately so the ticker has a price right away
@@ -249,6 +256,7 @@ class SimulatorDataSource(MarketDataSource):
             logger.info("Simulator: added ticker %s", ticker)
 
     async def remove_ticker(self, ticker: str) -> None:
+        ticker = _normalize(ticker)
         if self._sim:
             self._sim.remove_ticker(ticker)
         self._cache.remove(ticker)
