@@ -55,7 +55,8 @@ async def _generate_events(
 ) -> AsyncGenerator[str, None]:
     """Async generator that yields SSE-formatted price events.
 
-    Sends all prices every `interval` seconds. Stops when the client
+    Checks the cache every `interval` seconds and sends all prices when the
+    cache version changed (including removals). Stops when the client
     disconnects (detected via request.is_disconnected()).
     """
     # Tell the client to retry after 1 second if the connection drops
@@ -76,12 +77,13 @@ async def _generate_events(
             if current_version != last_version:
                 last_version = current_version
                 prices = price_cache.get_all()
-
-                if prices:
-                    data = {ticker: update.to_dict() for ticker, update in prices.items()}
-                    payload = json.dumps(data)
-                    yield f"data: {payload}\n\n"
+                # Always emit on change — an empty snapshot tells clients the last
+                # ticker was removed
+                data = {ticker: update.to_dict() for ticker, update in prices.items()}
+                payload = json.dumps(data)
+                yield f"data: {payload}\n\n"
 
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("SSE stream cancelled for: %s", client_ip)
+        raise

@@ -4,14 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from massive import RESTClient
-from massive.rest.models import SnapshotMarketType
+from massive.rest.models import SnapshotMarketType, TickerSnapshot
 
 from .cache import PriceCache
 from .interface import MarketDataSource
 
 logger = logging.getLogger(__name__)
+
+NS_PER_SECOND = 1_000_000_000
+
+
+def parse_snapshot(snap: TickerSnapshot) -> tuple[str, float, float] | None:
+    """Extract (ticker, price, unix_seconds) from a snapshot, or None if unusable.
+
+    Every SDK field is Optional: last_trade is None for thinly traded tickers and
+    overnight (snapshots are cleared at 12am ET). Trade timestamps are nanoseconds.
+    """
+    trade = snap.last_trade
+    if not snap.ticker or trade is None or trade.price is None or trade.price <= 0:
+        return None
+    ts_ns = trade.sip_timestamp or snap.updated
+    timestamp = ts_ns / NS_PER_SECOND if ts_ns else time.time()
+    return snap.ticker, float(trade.price), timestamp
 
 
 class MassiveDataSource(MarketDataSource):
@@ -19,10 +36,14 @@ class MassiveDataSource(MarketDataSource):
 
     Polls GET /v2/snapshot/locale/us/markets/stocks/tickers for all watched
     tickers in a single API call, then writes results to the PriceCache.
+    The SDK is synchronous, so the call runs in a worker thread.
 
     Rate limits:
       - Free tier: 5 req/min → poll every 15s (default)
       - Paid tiers: higher limits → poll every 2-5s
+
+    The snapshot endpoint needs a Starter plan or above; a free Basic key gets
+    a 403 on every poll (logged, prices never appear).
     """
 
     def __init__(
@@ -30,25 +51,32 @@ class MassiveDataSource(MarketDataSource):
         api_key: str,
         price_cache: PriceCache,
         poll_interval: float = 15.0,
+        start_timeout: float = 10.0,
     ) -> None:
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
         self._api_key = api_key
         self._cache = price_cache
         self._interval = poll_interval
+        self._start_timeout = start_timeout
         self._tickers: list[str] = []
         self._task: asyncio.Task | None = None
         self._client: RESTClient | None = None
 
     async def start(self, tickers: list[str]) -> None:
         self._client = RESTClient(api_key=self._api_key)
-        self._tickers = list(tickers)
+        self._tickers = list(dict.fromkeys(t.strip().upper() for t in tickers))
 
-        # Do an immediate first poll so the cache has data right away
-        await self._poll_once()
+        # Immediate first poll so the cache is warm, but never block startup for long
+        try:
+            await asyncio.wait_for(self._poll_once(), timeout=self._start_timeout)
+        except TimeoutError:
+            logger.warning("Massive: initial poll timed out; continuing in background")
 
         self._task = asyncio.create_task(self._poll_loop(), name="massive-poller")
         logger.info(
             "Massive poller started: %d tickers, %.1fs interval",
-            len(tickers),
+            len(self._tickers),
             self._interval,
         )
 
@@ -88,41 +116,36 @@ class MassiveDataSource(MarketDataSource):
 
     async def _poll_once(self) -> None:
         """Execute one poll cycle: fetch snapshots, update cache."""
-        if not self._tickers or not self._client:
+        # Snapshot the list on the event loop; add_ticker may mutate it meanwhile
+        tickers = list(self._tickers)
+        if not tickers or not self._client:
             return
 
         try:
-            # The Massive RESTClient is synchronous — run in a thread to
-            # avoid blocking the event loop.
-            snapshots = await asyncio.to_thread(self._fetch_snapshots)
-            processed = 0
-            for snap in snapshots:
-                try:
-                    price = snap.last_trade.price
-                    # Massive timestamps are Unix milliseconds → convert to seconds
-                    timestamp = snap.last_trade.timestamp / 1000.0
-                    self._cache.update(
-                        ticker=snap.ticker,
-                        price=price,
-                        timestamp=timestamp,
-                    )
-                    processed += 1
-                except (AttributeError, TypeError) as e:
-                    logger.warning(
-                        "Skipping snapshot for %s: %s",
-                        getattr(snap, "ticker", "???"),
-                        e,
-                    )
-            logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
-
+            snapshots = await asyncio.to_thread(self._fetch_snapshots, tickers)
         except Exception as e:
-            logger.error("Massive poll failed: %s", e)
             # Don't re-raise — the loop will retry on the next interval.
-            # Common failures: 401 (bad key), 429 (rate limit), network errors.
+            # Common failures: 401 (bad key), 403 (plan), 429 (rate limit), network errors.
+            logger.error("Massive poll failed: %s", e)
+            return
 
-    def _fetch_snapshots(self) -> list:
-        """Synchronous call to the Massive REST API. Runs in a thread."""
+        # A ticker removed while the request was in flight must not reappear
+        tracked = set(self._tickers)
+        updated = 0
+        for snap in snapshots:
+            parsed = parse_snapshot(snap)
+            if parsed is None:
+                logger.debug("Massive: no usable trade for %s", getattr(snap, "ticker", "???"))
+                continue
+            ticker, price, timestamp = parsed
+            if ticker in tracked:
+                self._cache.update(ticker=ticker, price=price, timestamp=timestamp)
+                updated += 1
+        logger.debug("Massive poll: updated %d/%d tickers", updated, len(tickers))
+
+    def _fetch_snapshots(self, tickers: list[str]) -> list[TickerSnapshot]:
+        """Synchronous call to the Massive REST API. Runs in a worker thread."""
         return self._client.get_snapshot_all(
             market_type=SnapshotMarketType.STOCKS,
-            tickers=self._tickers,
+            tickers=tickers,
         )
